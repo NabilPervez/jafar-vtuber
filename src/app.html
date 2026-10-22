@@ -1,0 +1,335 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Jafar Puppet</title>
+<style>
+  :root { --bg:#0e0d12; --panel:#17151d; --line:#2a2633; --text:#ece6d8; --muted:#9a93a6; --gold:#d8b25a; }
+  * { box-sizing:border-box; }
+  html,body { margin:0; height:100%; background:var(--bg); color:var(--text); font:14px/1.4 system-ui,sans-serif; }
+  body.output { background:transparent; }
+  body.output.green { background:#00ff00; }
+  #stage { position:fixed; inset:0; width:100%; height:100%; display:block; }
+  #panel { position:fixed; top:12px; left:12px; width:290px; max-height:calc(100% - 24px); overflow:auto;
+           background:var(--panel); border:1px solid var(--line); border-radius:12px; padding:14px; }
+  body.output #panel, body.output #cam { display:none; }
+  h1 { font:600 16px Georgia,serif; color:var(--gold); margin:0 0 4px; }
+  .sub { color:var(--muted); font-size:12px; margin:0 0 12px; }
+  label { display:block; margin:10px 0 2px; color:var(--muted); font-size:12px; }
+  select,button,input[type=range] { width:100%; }
+  select,button { background:#211e29; color:var(--text); border:1px solid var(--line); border-radius:8px; padding:7px 9px; font:inherit; }
+  button { cursor:pointer; margin-top:8px; }
+  button.primary { background:var(--gold); color:#16130c; border-color:var(--gold); font-weight:600; }
+  .row { display:flex; gap:8px; } .row > * { flex:1; }
+  #status { margin-top:10px; font-size:12px; color:var(--muted); }
+  #status b { color:var(--text); }
+  #cam { position:fixed; right:12px; bottom:12px; width:200px; border-radius:10px; border:1px solid var(--line); transform:scaleX(-1); opacity:.85; }
+  .chk { display:flex; align-items:center; gap:8px; margin-top:10px; color:var(--muted); font-size:12px; }
+  .chk input { width:auto; }
+  code { background:#211e29; padding:1px 5px; border-radius:4px; font-size:11px; }
+  .help { font-size:11px; color:var(--muted); margin-top:12px; border-top:1px solid var(--line); padding-top:10px; }
+</style>
+</head>
+<body>
+<canvas id="stage"></canvas>
+<video id="cam" playsinline muted></video>
+
+<div id="panel">
+  <h1>Jafar Puppet</h1>
+  <p class="sub">Webcam face tracking → chest-up puppet</p>
+
+  <label for="camSel">Camera</label>
+  <select id="camSel"><option>Loading…</option></select>
+  <button id="startBtn" class="primary">Start camera</button>
+  <button id="calBtn">Calibrate (hold a neutral face)</button>
+
+  <label>Head motion <span id="vHead"></span></label>
+  <input id="sHead" type="range" min="0" max="2" step="0.05" value="1">
+  <label>Mouth sensitivity <span id="vMouth"></span></label>
+  <input id="sMouth" type="range" min="0.5" max="3" step="0.05" value="1.6">
+  <label>Blink threshold <span id="vBlink"></span></label>
+  <input id="sBlink" type="range" min="0.2" max="0.8" step="0.02" value="0.45">
+  <label>Smoothing <span id="vSmooth"></span></label>
+  <input id="sSmooth" type="range" min="0" max="0.9" step="0.05" value="0.55">
+
+  <div class="chk"><input id="cMirror" type="checkbox" checked><label for="cMirror" style="margin:0">Mirror (move like a mirror)</label></div>
+  <div class="chk"><input id="cGreen" type="checkbox"><label for="cGreen" style="margin:0">Green background</label></div>
+  <div class="chk"><input id="cPreview" type="checkbox" checked><label for="cPreview" style="margin:0">Show webcam preview</label></div>
+
+  <div id="status">Status: <b id="st">idle</b></div>
+  <div class="help">
+    OBS: add a Browser Source pointing at this file with <code>?output</code> on the end (transparent). Add <code>&amp;bg=green</code> for a green key instead.
+  </div>
+</div>
+
+<script type="module">
+// ---------- art + rig constants (pixel coords in the 627x627 art) ----------
+const ART_SRC = "__ART__";
+const RIG = {
+  size: 627,
+  pivot: [307, 315],          // neck pivot for head roll
+  face: [305, 200, 75],       // face center + radius (parallax weighting)
+  headBottom: [280, 335],     // head weight fades out between these y values
+  eyes: [
+    { cx: 264, cy: 181, rx: 19, ry: 9 },   // viewer-left eye
+    { cx: 337, cy: 177, rx: 19, ry: 8 },   // viewer-right eye
+  ],
+  mouth: { cx: 307, cy: 246, rx: 19 },
+  lid: "#8d5c43", lash: "#140c09", mouthDark: "#2a0d0a", teeth: "#e9dccb",
+};
+
+// ---------- settings (localStorage is a convenience only) ----------
+const qs = new URLSearchParams(location.search);
+const OUTPUT = qs.has("output");
+if (OUTPUT) document.body.classList.add("output");
+const ids = ["sHead","sMouth","sBlink","sSmooth","cMirror","cGreen","cPreview"];
+const el = id => document.getElementById(id);
+let saved = {}; try { saved = JSON.parse(localStorage.getItem("jafar-settings") || "{}"); } catch {}
+for (const id of ids) if (id in saved) { const e = el(id); e.type === "checkbox" ? e.checked = saved[id] : e.value = saved[id]; }
+const S = {};
+function readSettings() {
+  for (const id of ids) { const e = el(id); S[id] = e.type === "checkbox" ? e.checked : parseFloat(e.value); }
+  el("vHead").textContent = S.sHead.toFixed(2); el("vMouth").textContent = S.sMouth.toFixed(2);
+  el("vBlink").textContent = S.sBlink.toFixed(2); el("vSmooth").textContent = S.sSmooth.toFixed(2);
+  const green = S.cGreen || qs.get("bg") === "green";
+  document.body.classList.toggle("green", green && OUTPUT);
+  document.body.style.background = !OUTPUT ? (green ? "#00ff00" : "") : "";
+  el("cam").style.display = (!OUTPUT && S.cPreview) ? "block" : "none";
+  try { localStorage.setItem("jafar-settings", JSON.stringify(S)); } catch {}
+}
+ids.forEach(id => el(id).addEventListener("input", readSettings));
+readSettings();
+const setStatus = t => { el("st").textContent = t; };
+
+// ---------- load art ----------
+const art = new Image(); art.src = ART_SRC; await art.decode();
+const paint = document.createElement("canvas"); paint.width = paint.height = RIG.size;
+const pctx = paint.getContext("2d");
+
+// ---------- WebGL mesh warp ----------
+const canvas = el("stage");
+const gl = canvas.getContext("webgl", { premultipliedAlpha: true, alpha: true, antialias: true });
+const vs = `attribute vec2 aPos; attribute vec2 aUV; uniform vec2 uView; uniform vec3 uXform; varying vec2 vUV;
+  void main(){ vec2 p = aPos * uXform.z + uXform.xy; vec2 c = p / uView * 2.0 - 1.0; gl_Position = vec4(c.x, -c.y, 0, 1); vUV = aUV; }`;
+const fs = `precision mediump float; uniform sampler2D uTex; varying vec2 vUV; void main(){ gl_FragColor = texture2D(uTex, vUV); }`;
+function sh(type, src) { const s = gl.createShader(type); gl.shaderSource(s, src); gl.compileShader(s); return s; }
+const prog = gl.createProgram(); gl.attachShader(prog, sh(gl.VERTEX_SHADER, vs)); gl.attachShader(prog, sh(gl.FRAGMENT_SHADER, fs)); gl.linkProgram(prog); gl.useProgram(prog);
+const N = 48; // grid resolution
+const base = [], uvs = [], idx = [];
+for (let j = 0; j <= N; j++) for (let i = 0; i <= N; i++) { base.push(i / N * RIG.size, j / N * RIG.size); uvs.push(i / N, j / N); }
+for (let j = 0; j < N; j++) for (let i = 0; i < N; i++) { const a = j * (N + 1) + i, b = a + 1, c = a + N + 1, d = c + 1; idx.push(a, b, c, b, d, c); }
+const posBuf = gl.createBuffer(), uvBuf = gl.createBuffer(), idxBuf = gl.createBuffer();
+gl.bindBuffer(gl.ARRAY_BUFFER, uvBuf); gl.bufferData(gl.ARRAY_BUFFER, new Float32Array(uvs), gl.STATIC_DRAW);
+const aUV = gl.getAttribLocation(prog, "aUV"); gl.enableVertexAttribArray(aUV); gl.vertexAttribPointer(aUV, 2, gl.FLOAT, false, 0, 0);
+gl.bindBuffer(gl.ELEMENT_ARRAY_BUFFER, idxBuf); gl.bufferData(gl.ELEMENT_ARRAY_BUFFER, new Uint16Array(idx), gl.STATIC_DRAW);
+const aPos = gl.getAttribLocation(prog, "aPos"); gl.enableVertexAttribArray(aPos);
+const tex = gl.createTexture(); gl.bindTexture(gl.TEXTURE_2D, tex);
+gl.pixelStorei(gl.UNPACK_PREMULTIPLY_ALPHA_WEBGL, true);
+[gl.TEXTURE_MIN_FILTER, gl.TEXTURE_MAG_FILTER].forEach(p => gl.texParameteri(gl.TEXTURE_2D, p, gl.LINEAR));
+[gl.TEXTURE_WRAP_S, gl.TEXTURE_WRAP_T].forEach(p => gl.texParameteri(gl.TEXTURE_2D, p, gl.CLAMP_TO_EDGE));
+gl.enable(gl.BLEND); gl.blendFunc(gl.ONE, gl.ONE_MINUS_SRC_ALPHA);
+const uView = gl.getUniformLocation(prog, "uView"), uXform = gl.getUniformLocation(prog, "uXform");
+const warped = new Float32Array(base.length);
+
+const smooth = (a, b, x) => { const t = Math.min(1, Math.max(0, (x - a) / (b - a))); return t * t * (3 - 2 * t); };
+
+// pose: yaw/pitch/roll in radians-ish units, jaw 0..1, blinkL/R 0..1 (1 = closed), gazeX/Y -1..1, breath
+function warp(p, t) {
+  const [px, py] = RIG.pivot, [fx, fy, fr] = RIG.face, [hb0, hb1] = RIG.headBottom;
+  const k = S.sHead;
+  const cosR = Math.cos(p.roll * k), sinR = Math.sin(p.roll * k);
+  const breath = Math.sin(t * 1.6) * 1.6;
+  for (let v = 0; v < base.length; v += 2) {
+    let x = base[v], y = base[v + 1];
+    const wH = 1 - smooth(hb0, hb1, y);                         // head weight
+    const dF = Math.hypot(x - fx, y - fy) / fr;
+    const face = Math.exp(-dF * dF);                            // 1 at face center
+    // yaw / pitch parallax: face features slide further than the outline
+    x += wH * p.yaw * k * (14 + 22 * face);
+    y += wH * p.pitch * k * (10 + 16 * face);
+    // roll around the neck pivot
+    if (wH > 0) {
+      const rx = x - px, ry = y - py;
+      const nx = px + rx * cosR - ry * sinR, ny = py + rx * sinR + ry * cosR;
+      x += (nx - x) * wH; y += (ny - y) * wH;
+    }
+    // jaw drop: chin region moves down
+    const jw = Math.exp(-(((x - 307) / 55) ** 2) - (((y - 285) / 32) ** 2)) * smooth(242, 258, base[v + 1]);
+    y += p.jaw * 12 * jw;
+    // body: gentle follow + breathing (shoulders rise more than the waist)
+    x += p.yaw * k * 4 * (1 - wH);
+    y -= breath * smooth(250, 627, base[v + 1]) * (1 - wH) + breath * 0.6 * wH;
+    warped[v] = x; warped[v + 1] = y;
+  }
+}
+
+function paintFace(p) {
+  pctx.clearRect(0, 0, RIG.size, RIG.size);
+  pctx.drawImage(art, 0, 0, RIG.size, RIG.size);
+  // eyes: gaze shift inside the eye, then eyelid
+  RIG.eyes.forEach((e, i) => {
+    const closed = i === 0 ? p.blinkL : p.blinkR;
+    pctx.save();
+    pctx.beginPath(); pctx.ellipse(e.cx, e.cy, e.rx, e.ry, 0, 0, Math.PI * 2); pctx.clip();
+    const gx = p.gazeX * 3.5, gy = p.gazeY * 2;
+    if (Math.abs(gx) + Math.abs(gy) > 0.05) {
+      pctx.drawImage(art, e.cx - e.rx, e.cy - e.ry, e.rx * 2, e.ry * 2, e.cx - e.rx + gx, e.cy - e.ry + gy, e.rx * 2, e.ry * 2);
+    }
+    const top = e.cy - e.ry - 1, lidY = top + (e.ry * 2 * 0.85) * closed;
+    if (closed > 0.02) { pctx.fillStyle = RIG.lid; pctx.fillRect(e.cx - e.rx - 2, top, e.rx * 2 + 4, lidY - top); }
+    pctx.restore();
+    if (closed > 0.35) { // lash line drawn outside the clip so it stays visible
+      pctx.strokeStyle = RIG.lash; pctx.lineWidth = 2.4; pctx.lineCap = "round"; pctx.globalAlpha = Math.min(1, (closed - 0.35) * 3);
+      pctx.beginPath(); pctx.moveTo(e.cx - e.rx * 0.95, lidY - 2);
+      pctx.quadraticCurveTo(e.cx, lidY + 3, e.cx + e.rx * 0.95, lidY - 2); pctx.stroke(); pctx.globalAlpha = 1;
+    }
+  });
+  // mouth: dark opening under the mustache
+  if (p.jaw > 0.03) {
+    const m = RIG.mouth, ry = 1.5 + p.jaw * 7, rx = m.rx * (0.9 + p.smile * 0.25);
+    pctx.save();
+    pctx.fillStyle = RIG.mouthDark;
+    pctx.beginPath(); pctx.ellipse(m.cx, m.cy + ry * 0.55, rx, ry, 0, 0, Math.PI * 2); pctx.fill();
+    pctx.beginPath(); pctx.ellipse(m.cx, m.cy + ry * 0.55, rx, ry, 0, 0, Math.PI * 2); pctx.clip();
+    pctx.fillStyle = RIG.teeth; pctx.fillRect(m.cx - rx, m.cy - ry * 0.45, rx * 2, Math.max(1.5, ry * 0.45));
+    pctx.restore();
+  }
+}
+
+function resize() {
+  const dpr = Math.min(2, devicePixelRatio || 1);
+  canvas.width = innerWidth * dpr; canvas.height = innerHeight * dpr;
+  gl.viewport(0, 0, canvas.width, canvas.height);
+}
+addEventListener("resize", resize); resize();
+
+function draw(p, t) {
+  paintFace(p);
+  gl.bindTexture(gl.TEXTURE_2D, tex);
+  gl.texImage2D(gl.TEXTURE_2D, 0, gl.RGBA, gl.RGBA, gl.UNSIGNED_BYTE, paint);
+  warp(p, t);
+  gl.bindBuffer(gl.ARRAY_BUFFER, posBuf); gl.bufferData(gl.ARRAY_BUFFER, warped, gl.DYNAMIC_DRAW);
+  gl.vertexAttribPointer(aPos, 2, gl.FLOAT, false, 0, 0);
+  // fit: character fills the height, anchored to the bottom
+  const scale = Math.min(canvas.width, canvas.height) / RIG.size * 0.98;
+  const ox = (canvas.width - RIG.size * scale) / 2, oy = canvas.height - RIG.size * scale;
+  gl.uniform2f(uView, canvas.width, canvas.height); gl.uniform3f(uXform, ox, oy, scale);
+  gl.clearColor(0, 0, 0, 0); gl.clear(gl.COLOR_BUFFER_BIT);
+  gl.drawElements(gl.TRIANGLES, idx.length, gl.UNSIGNED_SHORT, 0);
+}
+
+// ---------- tracking ----------
+const target = { yaw: 0, pitch: 0, roll: 0, jaw: 0, smile: 0, blinkL: 0, blinkR: 0, gazeX: 0, gazeY: 0 };
+const pose = { ...target };
+let neutral = { yaw: 0, pitch: 0, roll: 0, jaw: 0 };
+let lastFace = -1e9, landmarker = null, video = el("cam"), running = false, calibrateAt = 0;
+let nextAutoBlink = 2, autoBlinkT = -1;
+
+function anglesFromMatrix(m) {
+  // column-major 4x4 from MediaPipe; rotation part
+  const r00 = m[0], r10 = m[1], r20 = m[2], r21 = m[6], r22 = m[10];
+  const pitch = Math.atan2(-r21, r22) * -1;
+  const yaw = Math.asin(Math.max(-1, Math.min(1, -r20)));
+  const roll = Math.atan2(r10, r00);
+  return { yaw, pitch, roll };
+}
+
+async function initTracker() {
+  setStatus("loading face tracker…");
+  const V = "0.10.14";
+  const vision = await import(`https://cdn.jsdelivr.net/npm/@mediapipe/tasks-vision@${V}/vision_bundle.mjs`);
+  const files = await vision.FilesetResolver.forVisionTasks(`https://cdn.jsdelivr.net/npm/@mediapipe/tasks-vision@${V}/wasm`);
+  landmarker = await vision.FaceLandmarker.createFromOptions(files, {
+    baseOptions: { modelAssetPath: "https://storage.googleapis.com/mediapipe-models/face_landmarker/face_landmarker/float16/1/face_landmarker.task", delegate: "GPU" },
+    runningMode: "VIDEO", numFaces: 1, outputFaceBlendshapes: true, outputFacialTransformationMatrixes: true,
+  });
+}
+
+async function listCams() {
+  try {
+    const devs = (await navigator.mediaDevices.enumerateDevices()).filter(d => d.kind === "videoinput");
+    const sel = el("camSel"); sel.innerHTML = "";
+    devs.forEach((d, i) => { const o = document.createElement("option"); o.value = d.deviceId; o.textContent = d.label || `Camera ${i + 1}`; sel.appendChild(o); });
+    if (saved.camId) sel.value = saved.camId;
+  } catch {}
+}
+
+async function startCam() {
+  try {
+    if (!navigator.mediaDevices?.getUserMedia) throw new Error("This browser can't access cameras here (OBS needs --enable-media-stream, see README).");
+    if (!landmarker) await initTracker();
+    setStatus("starting camera…");
+    const id = el("camSel").value;
+    const stream = await navigator.mediaDevices.getUserMedia({ video: { deviceId: id ? { exact: id } : undefined, width: 640, height: 480 } });
+    video.srcObject = stream; await video.play();
+    try { saved.camId = id; localStorage.setItem("jafar-cam", id || ""); } catch {}
+    running = true; setStatus("tracking"); listCams();
+  } catch (e) {
+    const msg = e.name === "NotAllowedError" ? "camera permission denied — allow it in the browser and retry"
+              : e.name === "NotReadableError" ? "camera busy — close other apps (or OBS's own webcam source) using it"
+              : (e.message || String(e));
+    setStatus(msg);
+  }
+}
+el("startBtn").onclick = startCam;
+el("calBtn").onclick = () => { calibrateAt = performance.now(); setStatus("calibrating… hold still"); };
+
+let lastVideoTime = -1;
+function track(now) {
+  if (!running || !landmarker || video.readyState < 2 || video.currentTime === lastVideoTime) return;
+  lastVideoTime = video.currentTime;
+  const r = landmarker.detectForVideo(video, now);
+  if (!r.faceBlendshapes?.length) return;
+  lastFace = now;
+  const bs = {}; for (const c of r.faceBlendshapes[0].categories) bs[c.categoryName] = c.score;
+  const a = anglesFromMatrix(r.facialTransformationMatrixes[0].data);
+  if (calibrateAt && now - calibrateAt < 900) {
+    neutral = { yaw: a.yaw, pitch: a.pitch, roll: a.roll, jaw: bs.jawOpen || 0 };
+  } else if (calibrateAt) { calibrateAt = 0; setStatus("tracking (calibrated)"); }
+  const mir = S.cMirror ? -1 : 1;
+  target.yaw = (a.yaw - neutral.yaw) * mir;
+  target.pitch = -(a.pitch - neutral.pitch);
+  target.roll = (a.roll - neutral.roll) * mir;
+  target.jaw = Math.min(1, Math.max(0, ((bs.jawOpen || 0) - neutral.jaw) * S.sMouth));
+  target.smile = ((bs.mouthSmileLeft || 0) + (bs.mouthSmileRight || 0)) / 2;
+  const th = S.sBlink, b = v => smooth(th - 0.15, th + 0.1, v);
+  // mirrored: the user's left eye is on the viewer's right
+  const L = b(bs.eyeBlinkLeft || 0), R = b(bs.eyeBlinkRight || 0);
+  target.blinkL = S.cMirror ? L : R; target.blinkR = S.cMirror ? R : L;
+  const lookR = ((bs.eyeLookOutRight || 0) + (bs.eyeLookInLeft || 0)) / 2;
+  const lookL = ((bs.eyeLookOutLeft || 0) + (bs.eyeLookInRight || 0)) / 2;
+  target.gazeX = (lookL - lookR) * 2 * mir;
+  target.gazeY = (((bs.eyeLookDownLeft || 0) + (bs.eyeLookDownRight || 0)) - ((bs.eyeLookUpLeft || 0) + (bs.eyeLookUpRight || 0))) ;
+}
+
+// ---------- loop ----------
+let prev = performance.now();
+function frame(now) {
+  const t = now / 1000, dt = Math.min(0.1, (now - prev) / 1000); prev = now;
+  try { track(now); } catch (e) { console.warn(e); }
+  const lost = now - lastFace > 500;
+  if (lost) {
+    // idle: drift back to neutral, auto-blink
+    for (const k of ["yaw", "pitch", "roll", "jaw", "gazeX", "gazeY", "smile"]) target[k] *= 0.9;
+    target.yaw += Math.sin(t * 0.4) * 0.002;
+    if (autoBlinkT < 0 && t > nextAutoBlink) { autoBlinkT = 0; }
+    if (autoBlinkT >= 0) {
+      autoBlinkT += dt; const c = autoBlinkT < 0.08 ? autoBlinkT / 0.08 : Math.max(0, 1 - (autoBlinkT - 0.08) / 0.1);
+      target.blinkL = target.blinkR = c;
+      if (autoBlinkT > 0.2) { autoBlinkT = -1; nextAutoBlink = t + 2.5 + Math.random() * 3; }
+    } else target.blinkL = target.blinkR = 0;
+  }
+  // smoothing (blinks stay snappy)
+  const a = 1 - S.sSmooth, ab = Math.max(a, 0.7);
+  for (const k in pose) pose[k] += (target[k] - pose[k]) * (k.startsWith("blink") ? ab : a);
+  draw(pose, t);
+  requestAnimationFrame(frame);
+}
+requestAnimationFrame(frame);
+listCams();
+if (OUTPUT || qs.has("autostart")) startCam();
+window.__pose = target; window.__faceSeen = () => { lastFace = performance.now(); }; // test hooks
+</script>
+</body>
+</html>
