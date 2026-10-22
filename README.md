@@ -22,3 +22,7 @@ Note: Windows often lets only one app use a webcam. If OBS also has your webcam 
 - Head turns are a 2.5D warp, so large turns (over ~25°) will look stretched. Clamp with the Head motion slider.
 - Closed eyes and the open mouth are painted in code, not hand-drawn art.
 - First load needs internet (tracking library and model).
+
+## Lore and splash page
+- `splash/index.html` — champion-style character page (Lore, Abilities, The City, D&D sheet) with generated sound. Open it directly or serve the folder; it needs `splash.jpg` and `full.png` beside it.
+- `lore/jafar-bible.md` — character profile, Neo-Baghdad world bible, D&D 5e sheet (Artificer 5), story hooks.
